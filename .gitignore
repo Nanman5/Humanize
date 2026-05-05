@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local logs / runtime artifacts
+*.log
+.launchd-*.log
+
+# Local env
+.env
+.env.local
+.env.*.local
+
+# Test outputs
+/tmp/
+*_out.jpg
+test_*.jpg
