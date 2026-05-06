@@ -7,8 +7,8 @@ Permitir redimensionar imágenes a dimensiones exactas (ej: 1152×2048) desde la
 ## Decisiones
 
 - **Cliente-side (Canvas API).** El resize es trivial; no hace sentido round-trip a Python. Cero cambios en `humanize.py` / `api.py`. Cero dependencias nuevas.
-- **Modo cover.** La imagen escala para llenar el rectángulo y recorta lo que sobra (centrado). El usuario indicó que las diferencias de aspect ratio serán mínimas, por lo que el recorte invisible es preferible a letterbox (bandas) o stretch (deformación).
-- **Doble integración.** Página standalone `/resize` + sección opcional en la página de humanize.
+- **Cover con encuadre manual** (en `/resize`) **o auto-centrado** (en humanize). En la página standalone, cada imagen tiene un editor estilo iPhone Photos: arrastrar para reposicionar y zoom (rueda + slider). En el flujo humanize, sigue siendo cover automático centrado para no romper el batch.
+- **Doble integración.** Página standalone `/resize` con encuadre manual + sección opcional auto-cover en la página de humanize.
 
 ## Arquitectura
 
@@ -19,19 +19,26 @@ web/app/resize/      ← página standalone
 web/app/page.tsx     ← página existente; agrega sección "Resize después de humanizar"
 ```
 
-### `resizeCover(blob, w, h)`
+### `lib/resize.ts` API
 
 ```ts
-export async function resizeCover(blob: Blob, w: number, h: number): Promise<Blob>
+interface CropTransform { scale: number; offsetX: number; offsetY: number }
+
+coverScale(srcW, srcH, targetW, targetH): number
+defaultCrop(srcW, srcH, targetW, targetH): CropTransform
+clampCrop(t, srcW, srcH, targetW, targetH): CropTransform
+renderCrop(bitmap, targetW, targetH, transform, outType, quality): Promise<Blob>
+resizeCover(blob, targetW, targetH): Promise<Blob>   // wrapper: defaultCrop + renderCrop
+renameWithSize(name, w, h, forceJpegIfPng): string
 ```
 
-- `createImageBitmap(blob)` decodifica la imagen.
-- Calcula factor de escala = `max(w / srcW, h / srcH)` (cover).
-- Calcula offsets centrados.
-- Pinta en `OffscreenCanvas(w, h)` con `drawImage(img, sx, sy, sw, sh, 0, 0, w, h)`.
-- `convertToBlob({ type: blob.type === "image/png" ? "image/png" : "image/jpeg", quality: 0.92 })`.
+- `scale` y `offset` son en espacio de la imagen fuente. `clampCrop` garantiza que la imagen aún cubre el frame.
+- `renderCrop` usa `OffscreenCanvas` con fallback a `<canvas>`.
+- `resizeCover` es el shortcut "automático" usado por la integración humanize.
 
-Mantener formato del blob de entrada (PNG → PNG, cualquier otro → JPEG q=0.92, que es lo que el backend ya devuelve).
+### `app/resize/CropEditor.tsx`
+
+Componente canvas que muestra el frame al aspect ratio target, con la imagen renderizada vía `drawImage`. Pointer events para drag (`setPointerCapture`), wheel para zoom (`Math.exp(-deltaY * 0.0015)` por tick), slider HTML range para zoom 1×–4× sobre el `coverScale` mínimo. Devuelve cambios al padre via `onChange`.
 
 ### Presets
 
@@ -51,11 +58,13 @@ Agregar uno nuevo = una línea en `presets.ts`.
 
 Reutiliza patrones de la página actual (drag&drop, batch grid, ZIP download). UI:
 
-1. Dropzone (multi-archivo).
-2. Selector de preset: chips agrupados por categoría + dos inputs `W` y `H` que se sincronizan con el chip activo (clickear un chip rellena los inputs; editar los inputs deselecciona el chip).
-3. Botón "Procesar" → corre `resizeCover` por archivo en paralelo (`Promise.all`).
-4. Grid de resultados con preview + descarga individual.
-5. Botón "Descargar ZIP" cuando hay ≥1 resultado.
+1. Dropzone (multi-archivo). Cada archivo se decodifica a `ImageBitmap` async; estado por job: `pending → loading → ready`.
+2. Selector de preset: chips agrupados por categoría + inputs custom W/H. Cambiar el target dispara `clampCrop` sobre todos los transforms existentes (mantienen zoom intent, recortando offsets fuera de bounds).
+3. Cada job-card monta un `<CropEditor>` con su `bitmap` y `transform` (inicializado a `defaultCrop`). El usuario puede arrastrar y zoomear independientemente cada imagen.
+4. "Procesar" corre `renderCrop` con el transform de cada job en paralelo.
+5. Cada resultado: preview + descarga individual; botón "Descargar ZIP" cuando hay ≥1 listo.
+
+El bitmap se mantiene vivo hasta `clearAll()` o reemplazo de archivos (memoria liberada con `bitmap.close()`).
 
 ### Integración en humanize (página existente)
 

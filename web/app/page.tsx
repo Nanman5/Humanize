@@ -1,7 +1,10 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { zipSync } from "fflate";
+import { PRESET_GROUPS, RESIZE_PRESETS, findPreset } from "@/lib/presets";
+import { resizeCover } from "@/lib/resize";
 
 const PRESETS = [
   { id: "light", label: "Light", desc: "Solo strip de metadatos + JPEG re-encode" },
@@ -28,7 +31,12 @@ export default function Home() {
   const [preset, setPreset] = useState<PresetId>("strong");
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [resizeOn, setResizeOn] = useState(false);
+  const [resizeW, setResizeW] = useState(1152);
+  const [resizeH, setResizeH] = useState(2048);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const activeResizePresetId = findPreset(resizeW, resizeH)?.id;
 
   useEffect(() => {
     return () => {
@@ -80,10 +88,19 @@ export default function Home() {
       const text = await res.text().catch(() => "");
       throw new Error(text || `HTTP ${res.status}`);
     }
-    const blob = await res.blob();
+    let blob = await res.blob();
     const cd = res.headers.get("content-disposition") || "";
     const match = cd.match(/filename="([^"]+)"/);
-    const resultName = match ? match[1] : "humanized.jpg";
+    let resultName = match ? match[1] : "humanized.jpg";
+
+    if (resizeOn && resizeW > 0 && resizeH > 0) {
+      blob = await resizeCover(blob, resizeW, resizeH);
+      const dot = resultName.lastIndexOf(".");
+      const stem = dot > 0 ? resultName.slice(0, dot) : resultName;
+      const ext = dot > 0 ? resultName.slice(dot) : ".jpg";
+      resultName = `${stem}_${resizeW}x${resizeH}${ext}`;
+    }
+
     return {
       status: "done",
       resultBlob: blob,
@@ -200,11 +217,19 @@ export default function Home() {
             Reduce huellas de detección de IA · batch processing
           </p>
         </div>
-        {jobs.length > 0 && (
-          <button className="ghost" onClick={clearAll} type="button">
-            Limpiar ({jobs.length})
-          </button>
-        )}
+        <nav className="nav-links">
+          <Link href="/" className="ghost active">
+            Humanize
+          </Link>
+          <Link href="/resize" className="ghost">
+            Resize
+          </Link>
+          {jobs.length > 0 && (
+            <button className="ghost" onClick={clearAll} type="button">
+              Limpiar ({jobs.length})
+            </button>
+          )}
+        </nav>
       </header>
 
       <section className="card">
@@ -256,6 +281,77 @@ export default function Home() {
             </button>
           ))}
         </div>
+
+        <details
+          className="resize-section"
+          open={resizeOn}
+          onToggle={(e) => setResizeOn((e.target as HTMLDetailsElement).open)}
+        >
+          <summary>
+            <span className="resize-summary-label">
+              <strong>Resize después de humanizar</strong>
+              <small>
+                {resizeOn ? `→ ${resizeW}×${resizeH}` : "opcional · cover, recorte centrado"}
+              </small>
+            </span>
+          </summary>
+
+          <div className="resize-body">
+            {PRESET_GROUPS.map((group) => (
+              <div key={group} className="preset-group">
+                <h3 className="preset-group-title">{group}</h3>
+                <div className="preset-chips">
+                  {RESIZE_PRESETS.filter((p) => p.group === group).map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      className={
+                        activeResizePresetId === p.id ? "chip active" : "chip"
+                      }
+                      onClick={() => {
+                        setResizeW(p.w);
+                        setResizeH(p.h);
+                      }}
+                    >
+                      <strong>{p.label}</strong>
+                      <small>
+                        {p.w}×{p.h}
+                      </small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            <div className="preset-group">
+              <h3 className="preset-group-title">Custom</h3>
+              <div className="custom-dims">
+                <label>
+                  <span>Ancho</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={16384}
+                    value={resizeW}
+                    onChange={(e) => setResizeW(Number(e.target.value) || 0)}
+                  />
+                </label>
+                <span className="dim-sep">×</span>
+                <label>
+                  <span>Alto</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={16384}
+                    value={resizeH}
+                    onChange={(e) => setResizeH(Number(e.target.value) || 0)}
+                  />
+                </label>
+                <span className="dim-px">px</span>
+              </div>
+            </div>
+          </div>
+        </details>
 
         <div className="actions">
           <button
