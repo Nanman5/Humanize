@@ -383,13 +383,15 @@ figure img {
   gap: 6px;
   color: #8a9aff;
   text-decoration: none;
+  font: inherit;
   font-weight: 600;
   font-size: 13px;
-  padding: 6px 10px;
+  padding: 8px 14px;
   border-radius: 6px;
   background: rgba(99, 115, 200, 0.12);
   border: 1px solid rgba(99, 115, 200, 0.25);
   transition: background 120ms;
+  cursor: pointer;
 }
 .download:hover {
   background: rgba(99, 115, 200, 0.22);

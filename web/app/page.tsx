@@ -4,7 +4,14 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { zipSync } from "fflate";
 import { PRESET_GROUPS, RESIZE_PRESETS, findPreset } from "@/lib/presets";
-import { resizeCover } from "@/lib/resize";
+import {
+  type CropTransform,
+  clampCrop,
+  defaultCrop,
+  renameWithSize,
+  renderCrop,
+} from "@/lib/resize";
+import { CropEditor } from "./resize/CropEditor";
 
 const PRESETS = [
   { id: "light", label: "Light", desc: "Solo strip de metadatos + JPEG re-encode" },
@@ -23,6 +30,8 @@ interface Job {
   resultUrl?: string;
   resultBlob?: Blob;
   resultName?: string;
+  bitmap?: ImageBitmap;
+  transform?: CropTransform;
   error?: string;
 }
 
@@ -38,14 +47,79 @@ export default function Home() {
 
   const activeResizePresetId = findPreset(resizeW, resizeH)?.id;
 
+  // Cleanup on unmount only
   useEffect(() => {
     return () => {
       jobs.forEach((j) => {
         URL.revokeObjectURL(j.sourceUrl);
         if (j.resultUrl) URL.revokeObjectURL(j.resultUrl);
+        j.bitmap?.close();
       });
     };
-  }, [jobs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // When resize is enabled (or new results arrive), decode any result blob lacking a bitmap
+  useEffect(() => {
+    if (!resizeOn) return;
+    const targets = jobs.filter(
+      (j) => j.status === "done" && j.resultBlob && !j.bitmap,
+    );
+    if (!targets.length) return;
+    let cancelled = false;
+
+    targets.forEach(async (job) => {
+      try {
+        const bitmap = await createImageBitmap(job.resultBlob!);
+        if (cancelled) {
+          bitmap.close();
+          return;
+        }
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === job.id
+              ? {
+                  ...j,
+                  bitmap,
+                  transform: defaultCrop(
+                    bitmap.width,
+                    bitmap.height,
+                    resizeW,
+                    resizeH,
+                  ),
+                }
+              : j,
+          ),
+        );
+      } catch {
+        // ignore decode failures; result download still available
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resizeOn, jobs.map((j) => `${j.id}:${j.status}`).join(",")]);
+
+  // Clamp existing transforms when target dims change
+  useEffect(() => {
+    setJobs((prev) =>
+      prev.map((j) => {
+        if (!j.bitmap || !j.transform) return j;
+        return {
+          ...j,
+          transform: clampCrop(
+            j.transform,
+            j.bitmap.width,
+            j.bitmap.height,
+            resizeW,
+            resizeH,
+          ),
+        };
+      }),
+    );
+  }, [resizeW, resizeH]);
 
   const addFiles = useCallback(
     (files: FileList | File[] | null | undefined) => {
@@ -56,6 +130,7 @@ export default function Home() {
         prev.forEach((j) => {
           URL.revokeObjectURL(j.sourceUrl);
           if (j.resultUrl) URL.revokeObjectURL(j.resultUrl);
+          j.bitmap?.close();
         });
         return arr.map((f) => ({
           id:
@@ -79,6 +154,24 @@ export default function Home() {
     [addFiles],
   );
 
+  function updateTransform(id: string, transform: CropTransform) {
+    setJobs((prev) =>
+      prev.map((j) => (j.id === id ? { ...j, transform } : j)),
+    );
+  }
+
+  function resetTransform(id: string) {
+    setJobs((prev) =>
+      prev.map((j) => {
+        if (j.id !== id || !j.bitmap) return j;
+        return {
+          ...j,
+          transform: defaultCrop(j.bitmap.width, j.bitmap.height, resizeW, resizeH),
+        };
+      }),
+    );
+  }
+
   async function processOne(job: Job): Promise<Partial<Job>> {
     const fd = new FormData();
     fd.append("file", job.file);
@@ -88,62 +181,74 @@ export default function Home() {
       const text = await res.text().catch(() => "");
       throw new Error(text || `HTTP ${res.status}`);
     }
-    let blob = await res.blob();
+    const blob = await res.blob();
     const cd = res.headers.get("content-disposition") || "";
     const match = cd.match(/filename="([^"]+)"/);
-    let resultName = match ? match[1] : "humanized.jpg";
+    const resultName = match ? match[1] : "humanized.jpg";
 
-    if (resizeOn && resizeW > 0 && resizeH > 0) {
-      blob = await resizeCover(blob, resizeW, resizeH);
-      const dot = resultName.lastIndexOf(".");
-      const stem = dot > 0 ? resultName.slice(0, dot) : resultName;
-      const ext = dot > 0 ? resultName.slice(dot) : ".jpg";
-      resultName = `${stem}_${resizeW}x${resizeH}${ext}`;
-    }
-
-    return {
+    const patch: Partial<Job> = {
       status: "done",
       resultBlob: blob,
       resultUrl: URL.createObjectURL(blob),
       resultName,
     };
+
+    if (resizeOn && resizeW > 0 && resizeH > 0) {
+      try {
+        const bitmap = await createImageBitmap(blob);
+        patch.bitmap = bitmap;
+        patch.transform = defaultCrop(
+          bitmap.width,
+          bitmap.height,
+          resizeW,
+          resizeH,
+        );
+      } catch {
+        // fall through; raw download still works
+      }
+    }
+
+    return patch;
   }
 
   async function processAll() {
     if (busy || !jobs.length) return;
     setBusy(true);
     setJobs((prev) =>
-      prev.map((j) => ({
-        ...j,
-        status: "processing" as const,
-        error: undefined,
-        resultUrl: j.resultUrl
-          ? (URL.revokeObjectURL(j.resultUrl), undefined)
-          : undefined,
-        resultBlob: undefined,
-        resultName: undefined,
-      })),
+      prev.map((j) => {
+        if (j.resultUrl) URL.revokeObjectURL(j.resultUrl);
+        j.bitmap?.close();
+        return {
+          ...j,
+          status: "processing" as const,
+          error: undefined,
+          resultUrl: undefined,
+          resultBlob: undefined,
+          resultName: undefined,
+          bitmap: undefined,
+          transform: undefined,
+        };
+      }),
     );
 
     const targets = jobs.map((j) => ({ id: j.id, file: j.file }));
-
     const results = await Promise.all(
       targets.map(async (t) => {
         try {
-          const updated = await processOne({
+          const patch = await processOne({
             id: t.id,
             file: t.file,
             sourceUrl: "",
             status: "processing",
           });
-          return { id: t.id, patch: updated };
+          return { id: t.id, patch };
         } catch (e) {
           return {
             id: t.id,
             patch: {
               status: "error" as const,
               error: e instanceof Error ? e.message : "error desconocido",
-            },
+            } satisfies Partial<Job>,
           };
         }
       }),
@@ -158,22 +263,57 @@ export default function Home() {
     setBusy(false);
   }
 
+  async function exportBlob(job: Job): Promise<{ blob: Blob; name: string }> {
+    if (resizeOn && job.bitmap && job.transform) {
+      const outType: "image/jpeg" | "image/png" =
+        (job.resultBlob?.type as "image/jpeg" | "image/png") === "image/png"
+          ? "image/png"
+          : "image/jpeg";
+      const blob = await renderCrop(
+        job.bitmap,
+        resizeW,
+        resizeH,
+        job.transform,
+        outType,
+      );
+      const baseName = job.resultName || "humanized.jpg";
+      const name = renameWithSize(baseName, resizeW, resizeH, outType !== "image/png");
+      return { blob, name };
+    }
+    return {
+      blob: job.resultBlob!,
+      name: job.resultName || "humanized.jpg",
+    };
+  }
+
+  async function downloadOne(job: Job) {
+    const { blob, name } = await exportBlob(job);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
   async function downloadZip() {
     const done = jobs.filter((j) => j.status === "done" && j.resultBlob);
     if (!done.length) return;
 
+    const exported = await Promise.all(done.map((j) => exportBlob(j)));
+
     const seen = new Map<string, number>();
     const fileMap: Record<string, Uint8Array> = {};
-
-    for (const j of done) {
-      const baseName = j.resultName || "humanized.jpg";
-      const dot = baseName.lastIndexOf(".");
-      const stem = dot > 0 ? baseName.slice(0, dot) : baseName;
-      const ext = dot > 0 ? baseName.slice(dot) : "";
-      const count = seen.get(baseName) ?? 0;
-      seen.set(baseName, count + 1);
-      const finalName = count === 0 ? baseName : `${stem}_${count}${ext}`;
-      const buf = new Uint8Array(await j.resultBlob!.arrayBuffer());
+    for (const { blob, name } of exported) {
+      const dot = name.lastIndexOf(".");
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : "";
+      const count = seen.get(name) ?? 0;
+      seen.set(name, count + 1);
+      const finalName = count === 0 ? name : `${stem}_${count}${ext}`;
+      const buf = new Uint8Array(await blob.arrayBuffer());
       fileMap[finalName] = buf;
     }
 
@@ -198,6 +338,7 @@ export default function Home() {
       prev.forEach((j) => {
         URL.revokeObjectURL(j.sourceUrl);
         if (j.resultUrl) URL.revokeObjectURL(j.resultUrl);
+        j.bitmap?.close();
       });
       return [];
     });
@@ -291,7 +432,9 @@ export default function Home() {
             <span className="resize-summary-label">
               <strong>Resize después de humanizar</strong>
               <small>
-                {resizeOn ? `→ ${resizeW}×${resizeH}` : "opcional · cover, recorte centrado"}
+                {resizeOn
+                  ? `→ ${resizeW}×${resizeH} · encuadre manual por imagen`
+                  : "opcional · arrastrá y zoom estilo iPhone Photos"}
               </small>
             </span>
           </summary>
@@ -389,35 +532,46 @@ export default function Home() {
       </section>
 
       {jobs.length > 0 && (
-        <section className="batch-grid">
+        <section className={`batch-grid ${resizeOn ? "editor-grid" : ""}`}>
           {jobs.map((j) => (
             <article key={j.id} className={`job-card status-${j.status}`}>
-              <div className="job-row">
-                <div className="job-thumb">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={j.sourceUrl} alt="" />
-                  <span className="thumb-label">Original</span>
+              {resizeOn && j.status === "done" && j.bitmap && j.transform ? (
+                <CropEditor
+                  bitmap={j.bitmap}
+                  targetW={resizeW}
+                  targetH={resizeH}
+                  transform={j.transform}
+                  onChange={(t) => updateTransform(j.id, t)}
+                  onReset={() => resetTransform(j.id)}
+                />
+              ) : (
+                <div className="job-row">
+                  <div className="job-thumb">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={j.sourceUrl} alt="" />
+                    <span className="thumb-label">Original</span>
+                  </div>
+                  <div className="job-thumb">
+                    {j.resultUrl ? (
+                      <>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={j.resultUrl} alt="" />
+                        <span className="thumb-label">Procesada</span>
+                      </>
+                    ) : (
+                      <div className="thumb-placeholder">
+                        {j.status === "processing" ? (
+                          <span className="spinner" aria-hidden />
+                        ) : j.status === "error" ? (
+                          <span className="placeholder-icon">!</span>
+                        ) : (
+                          <span className="placeholder-icon">?</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div className="job-thumb">
-                  {j.resultUrl ? (
-                    <>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={j.resultUrl} alt="" />
-                      <span className="thumb-label">Procesada</span>
-                    </>
-                  ) : (
-                    <div className="thumb-placeholder">
-                      {j.status === "processing" ? (
-                        <span className="spinner" aria-hidden />
-                      ) : j.status === "error" ? (
-                        <span className="placeholder-icon">!</span>
-                      ) : (
-                        <span className="placeholder-icon">?</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
+              )}
               <div className="job-meta">
                 <span className="job-name" title={j.file.name}>
                   {j.file.name}
@@ -432,14 +586,16 @@ export default function Home() {
               {j.status === "error" && j.error && (
                 <p className="job-error">{j.error}</p>
               )}
-              {j.status === "done" && j.resultUrl && (
-                <a
+              {j.status === "done" && j.resultBlob && (
+                <button
+                  type="button"
                   className="download"
-                  href={j.resultUrl}
-                  download={j.resultName}
+                  onClick={() => downloadOne(j)}
                 >
-                  Descargar
-                </a>
+                  {resizeOn && j.bitmap
+                    ? `Descargar ${resizeW}×${resizeH}`
+                    : "Descargar"}
+                </button>
               )}
             </article>
           ))}
