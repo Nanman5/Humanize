@@ -138,3 +138,23 @@ Or the standalone Gradio: `.venv/bin/python app.py` (auto-picks port 7860).
 - `.venv` is local; recreate with `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
 - `playwright install chromium` is a one-time step after pip install.
 - Ports in use during dev: FastAPI `:8002`, Next `:3003`. Both configurable.
+
+
+<!-- BEGIN:mini-deploy -->
+## Mini Deployment
+
+This repo deploys to the home Mac mini via `git push mini`. Master doc: `~/Projects/TOOLS/MINI_DEPLOY.md`.
+
+- **Slug / branch**: `humanize` / `main`
+- **Mini paths**: bare `~/srv/humanize.git`, working tree `~/srv/humanize`
+- **Stack**: Python (`requirements.txt`)
+- **Auto-start (pm2)**: ❌ — code is synced and venv is built, but no service runs. Add an `ecosystem.config.js` to enable.
+- **Mini venv**: `~/srv/humanize/.venv/` (built by `uv pip install -r requirements.txt`)
+
+```bash
+git push mini main
+ssh statim@statims-mini.lan 'ls ~/srv/humanize/.venv/bin'
+```
+
+GitHub backup is wired through the bare repo's `github` remote (configure once with `git --git-dir=~/srv/humanize.git remote add github git@github.com:Nanman5/Humanize.git` after registering the mini's deploy key in GitHub).
+<!-- END:mini-deploy -->
